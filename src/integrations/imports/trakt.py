@@ -1,5 +1,7 @@
 import json
 import logging
+import re
+import zipfile
 from collections import defaultdict
 
 import requests
@@ -9,6 +11,7 @@ from django.utils.dateparse import parse_datetime
 from django_celery_beat.models import PeriodicTask
 
 import app
+from app import helpers as app_helpers
 from app.models import MediaTypes, Sources, Status
 from app.providers import services
 from integrations.imports import helpers
@@ -19,19 +22,47 @@ logger = logging.getLogger(__name__)
 TRAKT_API_BASE_URL = "https://api.trakt.tv"
 BULK_PAGE_SIZE = 1000
 
+# The archive is expanded in the worker, so cap how much it may hold uncompressed.
+MAX_EXPORT_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
 
-def handle_oauth_callback(request):
+# Username used when the archive has no readable user-profile.json.
+EXPORT_FALLBACK_USERNAME = "Trakt User"
+
+# Convert Trakt API endpoints to the corresponding export file(s) that contain the data.
+ENDPOINTS_TO_FILES = {
+    "/history": ("watched-history",),
+    "/watchlist": ("lists-watchlist",),
+    "/ratings": (
+        "ratings-movies",
+        "ratings-shows",
+        "ratings-seasons",
+        "ratings-episodes",
+    ),
+    "/comments": (
+        "comments-movies",
+        "comments-shows",
+        "comments-seasons",
+        "comments-episodes",
+    ),
+}
+
+
+def handle_oauth_callback(request, redirect_uri=None):
     """View for getting the Trakt OAuth2 token."""
     code = request.GET["code"]
 
     url = "https://api.trakt.tv/oauth/token"
+    redirect_uri = redirect_uri or app_helpers.build_absolute_app_url(
+        request,
+        reverse("import_trakt_private"),
+    )
 
     params = {
         "client_id": settings.TRAKT_API,
         "client_secret": settings.TRAKT_API_SECRET,
         "code": code,
         "grant_type": "authorization_code",
-        "redirect_uri": request.build_absolute_uri(reverse("import_trakt_private")),
+        "redirect_uri": redirect_uri,
     }
 
     try:
@@ -80,19 +111,24 @@ def get_username_from_oauth(access_token):
     return request["username"]
 
 
-def get_access_token(encrypted_refresh_token):
+def get_access_token(encrypted_refresh_token, redirect_uri=None):
     """Get access token from encrypted refresh token."""
     url = "https://api.trakt.tv/oauth/token"
 
     decrypted_token = helpers.decrypt(encrypted_refresh_token)
+    redirect_uri = redirect_uri or app_helpers.build_absolute_app_url(
+        None,
+        reverse("import_trakt_private"),
+    )
 
     params = {
         "client_id": settings.TRAKT_API,
         "client_secret": settings.TRAKT_API_SECRET,
         "refresh_token": decrypted_token,
         "grant_type": "refresh_token",
-        "redirect_uri": f"{settings.BASE_URL}/import/trakt/private",
     }
+    if redirect_uri:
+        params["redirect_uri"] = redirect_uri
 
     try:
         request = app.providers.services.api_request(
@@ -126,27 +162,38 @@ def update_refresh_token(old_token, new_token):
         periodic_task.save()
 
 
-def importer(token, user, mode, username):
+def importer(token, user, mode, username=None, redirect_uri=None, file=None):
     """Import the user's data from Trakt.
 
-    Can import using either OAuth (token provided) or public username.
-    When using OAuth, username should be the authenticated user's username.
-    When using public import, username is the Trakt username and token should be None.
+    Can import using OAuth (token provided), public username, or an export archive
+    downloaded from the Trakt website.
 
     Args:
         token (str, optional): Encrypted OAuth2 refresh token if using OAuth else None
         user: Django user object to import data for
         mode (str): Import mode ("new" or "overwrite")
-        username (str): Trakt username to import from
+        username (str, optional): Trakt username if using API import else None
+        redirect_uri (str, optional): OAuth2 redirect URI if using OAuth else None
+        file (File, optional): Uploaded Trakt export archive else None
     """
-    trakt_importer = TraktImporter(username, user, mode, refresh_token=token)
+    if file:
+        trakt_importer = TraktExportImporter(file, user, mode)
+    else:
+        trakt_importer = TraktImporter(
+            username,
+            user,
+            mode,
+            refresh_token=token,
+            redirect_uri=redirect_uri,
+        )
+
     return trakt_importer.import_data()
 
 
 class TraktImporter:
     """Class to handle importing user data from Trakt."""
 
-    def __init__(self, username, user, mode, refresh_token=None):
+    def __init__(self, username, user, mode, refresh_token=None, redirect_uri=None):
         """Initialize the importer with user details and mode.
 
         Args:
@@ -160,6 +207,7 @@ class TraktImporter:
         self.user = user
         self.mode = mode
         self.refresh_token = refresh_token
+        self.redirect_uri = redirect_uri
         self.user_base_url = f"{TRAKT_API_BASE_URL}/users/{username}"
         self.warnings = []
 
@@ -211,7 +259,10 @@ class TraktImporter:
                 # already made api_request before, so access_token is set
                 headers["Authorization"] = f"Bearer {self.access_token}"
             except AttributeError:
-                self.access_token = get_access_token(self.refresh_token)
+                self.access_token = get_access_token(
+                    self.refresh_token,
+                    redirect_uri=self.redirect_uri,
+                )
                 headers["Authorization"] = f"Bearer {self.access_token}"
         return services.api_request(
             "TRAKT",
@@ -294,6 +345,10 @@ class TraktImporter:
             except Exception as e:
                 msg = f"Error processing history entry: {entry}"
                 raise MediaImportUnexpectedError(msg) from e
+
+    def _get_date(self, date_str):
+        """Parse a Trakt watched_at timestamp and strip seconds/microseconds."""
+        return parse_datetime(date_str).replace(second=0, microsecond=0)
 
     def _get_tmdb_id(self, entry_data):
         """Extract TMDB ID from entry data."""
@@ -395,7 +450,7 @@ class TraktImporter:
         movie_obj = app.models.Movie(
             item=item,
             user=self.user,
-            end_date=watched_at,
+            end_date=self._get_date(watched_at),
             status=Status.COMPLETED.value,
             progress=1,
         )
@@ -522,7 +577,7 @@ class TraktImporter:
         episode_obj = app.models.Episode(
             item=episode_item,
             related_season=season_obj,
-            end_date=watched_at,
+            end_date=self._get_date(watched_at),
         )
         episode_obj._history_date = parse_datetime(watched_at)
         self.media_instances[MediaTypes.EPISODE.value][ep_key].append(episode_obj)
@@ -759,3 +814,160 @@ class TraktImporter:
         for media_obj in self.media_instances[media_type][key]:
             for attr, value in defaults.items():
                 setattr(media_obj, attr, value)
+
+
+class TraktExportImporter(TraktImporter):
+    """Run the standard Trakt import against an export archive instead of the API."""
+
+    def __init__(self, file, user, mode):
+        """Initialize from a Trakt export archive."""
+        # The archive appends to this list while files are read during the import,
+        # so it is shared with the importer instead of being merged afterwards.
+        warnings = []
+        self.export_archive = TraktArchiveManager(file, warnings)
+
+        user_profile = self.export_archive.parse_json("user-profile")
+        username = (
+            user_profile.get("username")
+            if isinstance(user_profile, dict)
+            else EXPORT_FALLBACK_USERNAME
+        )
+
+        super().__init__(username or EXPORT_FALLBACK_USERNAME, user, mode)
+        self.warnings = warnings
+
+    def _make_api_request(self, url):
+        """Read from the export archive instead of making API calls."""
+        return self._get_paginated_data(url)
+
+    def _get_paginated_data(self, endpoint, item_type="items"):
+        """Read the export files matching the endpoint."""
+        relative_filepath = endpoint.removeprefix(self.user_base_url)
+        prefixes = ENDPOINTS_TO_FILES.get(relative_filepath)
+
+        if prefixes is None:
+            logger.warning("No Trakt export file mapped for endpoint %s", endpoint)
+            return []
+
+        # Read the JSON files from the export archive and concatenate their contents.
+        entries = self.export_archive.load(*prefixes)
+        logger.info(
+            "Retrieved %s total %s for user %s from export archive",
+            len(entries),
+            item_type,
+            self.username,
+        )
+        return entries
+
+
+class TraktArchiveManager:
+    """Class to manage a Trakt export archive."""
+
+    def __init__(self, file, warnings=None):
+        """Open the archive and index its JSON files.
+
+        Args:
+            file: Uploaded export archive, or any file-like object
+            warnings (list, optional): List to append read warnings to
+        """
+        try:
+            self.zipfile = zipfile.ZipFile(file)
+        except zipfile.BadZipFile as e:
+            msg = "The uploaded file is not a valid Trakt export archive."
+            raise MediaImportError(msg) from e
+
+        self.warnings = warnings if warnings is not None else []
+
+        # Map each JSON base name to its full path inside the archive, so archives
+        # that keep the export in a subdirectory can still be read.
+        self._files = {}
+
+        uncompressed_size = 0
+
+        # Check the uncompressed size of the archive to avoid memory issues.
+        # file_size is what the archive declares, so this is a guard against
+        # oversized exports rather than against deliberately crafted archives.
+        for info in self.zipfile.infolist():
+            if info.is_dir():
+                continue
+            uncompressed_size += info.file_size
+            if uncompressed_size > MAX_EXPORT_UNCOMPRESSED_BYTES:
+                msg = "The uncompressed Trakt export archive is too large to import."
+                raise MediaImportError(msg)
+
+            name = info.filename.rsplit("/", 1)[-1]
+            if not name.lower().endswith(".json"):
+                continue
+            # Store the base name without the .json suffix for easier matching.
+            self._files.setdefault(name[: -len(".json")], info.filename)
+
+        if not self._recognized_export():
+            msg = (
+                "The uploaded archive does not contain any Trakt export data. "
+                "Upload the ZIP file downloaded from the Trakt website."
+            )
+            raise MediaImportError(msg)
+
+    def _recognized_export(self):
+        """Check whether the archive holds at least one known export file."""
+        if "user-profile" in self._files:
+            return True
+
+        return any(
+            self._match_names(prefix)
+            for prefixes in ENDPOINTS_TO_FILES.values()
+            for prefix in prefixes
+        )
+
+    def parse_json(self, base_name):
+        """Read a JSON file from the archive, returning None when unavailable."""
+        filename = self._files.get(base_name)
+        if filename is None:
+            return None
+
+        try:
+            return json.loads(self.zipfile.read(filename))
+        except (KeyError, OSError, json.JSONDecodeError, UnicodeDecodeError):
+            logger.exception("Trakt export file %s could not be read", filename)
+            self.warnings.append(f"{base_name}.json: could not be read, skipped.")
+            return None
+
+    def load(self, *prefixes):
+        """Concatenate every file into a single list, sorted by page number."""
+        entries = []
+        for prefix in prefixes:
+            for base_name in self._match_names(prefix):
+                page = self.parse_json(base_name)
+                if page is None:
+                    # parse_json already recorded why the file was skipped.
+                    continue
+                if isinstance(page, list):
+                    entries.extend(page)
+                else:
+                    self.warnings.append(
+                        f"{base_name}.json: unexpected contents, skipped."
+                    )
+        return entries
+
+    def _match_names(self, prefix):
+        """Return base names for prefixes by page."""
+        names = []
+        if prefix in self._files:
+            names.append(prefix)
+
+        pages = {}
+        page_pattern = re.compile(rf"^{re.escape(prefix)}-(\d+)$")
+        for base_name in self._files:
+            match = page_pattern.match(base_name)
+            if match:
+                pages[int(match.group(1))] = base_name
+
+        # Trakt splits large sections into pages numbered contiguously from 1, e.g.
+        # watched-history-1.json. Only following that run keeps a custom list such as
+        # lists-watchlist-2025 from being read as a page of lists-watchlist.
+        page = 1
+        while page in pages:
+            names.append(pages[page])
+            page += 1
+
+        return names
